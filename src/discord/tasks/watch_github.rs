@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use poise::serenity_prelude as serenity;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 use crate::discord;
 use crate::discord::{DiscordData, DiscordError};
@@ -15,26 +15,45 @@ use crate::model;
 
 const WAKE_UP_FREQ_SECONDS: u64 = 60 * 5;
 
-static CANCEL_SLEEP: Mutex<Option<tokio::sync::mpsc::Sender<model::DiscordGuildId>>> =
+static WAKE_AND_REPORT_GUILD: Mutex<Option<mpsc::Sender<model::DiscordGuildId>>> =
     Mutex::const_new(None);
+static WAKE_AND_REPORT_USER: Mutex<
+    Option<mpsc::Sender<(model::DiscordGuildId, model::DiscordUserId)>>,
+> = Mutex::const_new(None);
 
 pub async fn watch_github(http: Arc<serenity::Http>, data: Arc<DiscordData>) {
     let mut interval: tokio::time::Interval =
         tokio::time::interval(std::time::Duration::from_secs(WAKE_UP_FREQ_SECONDS));
 
-    // A channel for `report()` to wake this task up before `interval`, asking
-    // for an immediate report in `filter_guild_id`.
-    let (send_cancel_sleep, mut recv_cancel_sleep) = tokio::sync::mpsc::channel(100);
-    CANCEL_SLEEP.lock().await.replace(send_cancel_sleep);
+    // A channel for `/report_all` to wake this task up before `interval`, asking
+    // for an immediate report for all users in a guild.
+    let (send_wake_and_report_guild, mut recv_wake_and_report_guild) = mpsc::channel(100);
+    WAKE_AND_REPORT_GUILD
+        .lock()
+        .await
+        .replace(send_wake_and_report_guild);
+
+    // A channel for `/wake` to wake this task up before `interval`, asking
+    // for an immediate report for a single user.
+    let (send_wake_and_report_user, mut recv_wake_and_report_user) = mpsc::channel(100);
+    WAKE_AND_REPORT_USER
+        .lock()
+        .await
+        .replace(send_wake_and_report_user);
 
     let mut last_report_timestamp = Utc::now();
-
+    // Loop forever, waiting for the next update period and doing the update.
     loop {
-        // Wait for the next update period.
         let mut filter_guild_id = None;
+        let mut filter_user_id = None;
         tokio::select! {
-            guild_id = recv_cancel_sleep.recv() => {
-                filter_guild_id = Some(guild_id.expect("CANCEL_SLEEP was closed"))
+            guild_id = recv_wake_and_report_guild.recv() => {
+                filter_guild_id = Some(guild_id.expect("WAKE_AND_REPORT_GUILD was closed"))
+            }
+            guild_and_user_id = recv_wake_and_report_user.recv() => {
+                let (guild_id, user_id) = guild_and_user_id.expect("WAKE_AND_REPORT_GUILD was closed");
+                filter_guild_id = Some(guild_id);
+                filter_user_id = Some(user_id);
             }
             _ = interval.tick() => {
             }
@@ -48,6 +67,7 @@ pub async fn watch_github(http: Arc<serenity::Http>, data: Arc<DiscordData>) {
             &last_report_timestamp,
             &now,
             std::mem::replace(&mut filter_guild_id, None),
+            std::mem::replace(&mut filter_user_id, None),
         )
         .await;
         match run_result {
@@ -70,6 +90,7 @@ async fn report_alerts(
     last_report_timestamp: &DateTime<Utc>,
     now: &DateTime<Utc>,
     ignore_time_for_guild_id: Option<model::DiscordGuildId>,
+    filter_to_discord_user: Option<model::DiscordUserId>,
 ) -> Result<(), DiscordError> {
     struct GuildAlerts {
         discord_channel_id: model::DiscordChannelId,
@@ -129,6 +150,11 @@ async fn report_alerts(
                 }
             }
 
+            if let Some(filter_user) = &filter_to_discord_user {
+                discord_user_ids_to_alert.retain_mut(|user| *user == *filter_user);
+                discord_user_ids_to_weekly_alert.retain_mut(|user| *user == *filter_user);
+            }
+
             let prs: Arc<Vec<_>> =
                 Arc::new(github::filter_prs_for_guild(prs_state, guild_config).collect());
             let issues: Arc<Vec<_>> = Arc::new(
@@ -161,7 +187,10 @@ async fn report_alerts(
             )
             .await?;
 
-            {
+            // Reset the timestamp for weekly alerts for each user that was just given
+            // their weekly alerts, but only if it was not done through a slash command
+            // like `/wake`.
+            if ignore_time_for_guild_id.is_none() && filter_to_discord_user.is_none() {
                 let mut cfg_guard = data.cfg.lock().await;
                 if let Some(guild_config) = cfg_guard.guilds.get_mut(&alert.discord_guild_id) {
                     for discord_user_id in &alert.discord_user_ids {
@@ -359,10 +388,26 @@ async fn report_weekly_alerts_for_user(
     Ok(())
 }
 
-pub async fn watch_github_wake_now(guild_id: model::DiscordGuildId) -> Result<(), DiscordError> {
-    let guard = CANCEL_SLEEP.lock().await;
+pub async fn watch_github_report_guild(
+    guild_id: model::DiscordGuildId,
+) -> Result<(), DiscordError> {
+    let guard = WAKE_AND_REPORT_GUILD.lock().await;
     if let Some(sender) = guard.as_ref() {
         match sender.send(guild_id).await {
+            Ok(()) => {}
+            Err(e) => return Err(e.to_string().into()),
+        }
+    }
+    Ok(())
+}
+
+pub async fn watch_github_report_user(
+    guild_id: model::DiscordGuildId,
+    user_id: model::DiscordUserId,
+) -> Result<(), DiscordError> {
+    let guard = WAKE_AND_REPORT_USER.lock().await;
+    if let Some(sender) = guard.as_ref() {
+        match sender.send((guild_id, user_id)).await {
             Ok(()) => {}
             Err(e) => return Err(e.to_string().into()),
         }

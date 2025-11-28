@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 use crate::discord::{DiscordContext, DiscordError};
+use crate::model;
 
 /// Report for all users immediately, ignoring their notification times.
 #[poise::command(
@@ -11,7 +12,8 @@ use crate::discord::{DiscordContext, DiscordError};
     default_member_permissions = "ADMINISTRATOR"
 )]
 pub async fn report_all(ctx: DiscordContext<'_>) -> Result<(), DiscordError> {
-    crate::discord::tasks::watch_github_wake_now(ctx.guild_id().unwrap().into()).await?;
+    let guild_id: model::DiscordGuildId = ctx.guild_id().unwrap().into();
+    crate::discord::tasks::watch_github_report_guild(guild_id).await?;
 
     ctx.send(
         poise::CreateReply::default()
